@@ -1,5 +1,3 @@
-# src/pipeline/orchestrator.py
-
 import hashlib
 import json
 
@@ -13,10 +11,6 @@ from src.storage.repository import AnalysisRepository
 
 
 class AnalysisPipeline:
-    """
-    Central orchestration layer.
-    Stable, defensive, and state-safe.
-    """
 
     def __init__(self):
         self.normalizer = CodeNormalizer()
@@ -25,8 +19,6 @@ class AnalysisPipeline:
         self.embedding_generator = EmbeddingGenerator()
         self.scorer = ScoreAggregator()
         self.repo = AnalysisRepository()
-
-        # CodeBERT embedding dimension
         self.faiss_index = FaissIndex(vector_dim=768)
 
     def _ast_similarity(self, a: dict, b: dict) -> float:
@@ -38,100 +30,97 @@ class AnalysisPipeline:
 
     def run(self, code: str, language: str | None = None) -> dict:
 
-        # 1️⃣ Normalize
         normalized_code, _ = self.normalizer.normalize(code)
 
-        # 2️⃣ AST
         ast_features = {}
         if language in (None, "python"):
             ast_features = self.ast_analyzer.analyze(normalized_code)
 
-        # 3️⃣ Embedding
         embedding = self.embedding_generator.generate(normalized_code)
         vector = embedding.detach().numpy()
 
-        # 4️⃣ FIRST SUBMISSION (HARD BASELINE)
+        # First submission baseline
         if self.faiss_index.size() == 0:
             self.faiss_index.add(vector)
-
-            code_hash = hashlib.sha256(code.encode()).hexdigest()
             self.repo.save_result(
-                code_hash=code_hash,
-                plagiarism_score=0.0,
-                ai_probability=0.0,
-                normalized_code=normalized_code,
-                ast_features=ast_features
+                hashlib.sha256(code.encode()).hexdigest(),
+                0.0,
+                0.0,
+                normalized_code,
+                ast_features
             )
-
             return {
                 "plagiarism_percentage": 0.0,
                 "ai_probability": 0.0,
-                "confidence": "low"
+                "confidence": "low",
+                "explanation": {
+                    "reasoning": "First submission baseline"
+                }
             }
 
-        # 5️⃣ SEMANTIC SIMILARITY (SEARCH BEFORE ADD)
         distances, _ = self.faiss_index.search(vector, k=1)
-        semantic_sim = 0.0
-        if distances and len(distances) > 0:
-            semantic_sim = 1 / (1 + float(distances[0]))
-
-        # 6️⃣ TOKEN + AST SIMILARITY (REAL HISTORY)
-        stored_rows = self.repo.fetch_all_for_similarity()
+        semantic_sim = 1 / (1 + distances[0]) if distances else 0.0
 
         token_sim = 0.0
         structure_sim = 0.0
 
-        for norm_db, ast_json in stored_rows:
-            # Token similarity
+        for norm_db, ast_json in self.repo.fetch_all_for_similarity():
             if norm_db:
-                ts = self.token_similarity.jaccard_similarity(
-                    normalized_code, norm_db
+                token_sim = max(
+                    token_sim,
+                    self.token_similarity.jaccard_similarity(
+                        normalized_code, norm_db
+                    )
                 )
-                token_sim = max(token_sim, ts)
-
-            # AST similarity
             if ast_json:
-                try:
-                    ast_old = json.loads(ast_json)
-                    ss = self._ast_similarity(ast_features, ast_old)
-                    structure_sim = max(structure_sim, ss)
-                except Exception:
-                    continue
+                structure_sim = max(
+                    structure_sim,
+                    self._ast_similarity(ast_features, json.loads(ast_json))
+                )
 
-        # 7️⃣ SCORE AGGREGATION
         plagiarism_score = self.scorer.compute_plagiarism_score(
-            token_similarity=token_sim,
-            semantic_similarity=semantic_sim,
-            structure_similarity=structure_sim
+            token_sim, semantic_sim, structure_sim
         )
 
         ai_probability = self.scorer.compute_ai_probability(
-            semantic_similarity=semantic_sim,
-            structure_similarity=structure_sim
+            semantic_sim, structure_sim
         )
 
-        # 8️⃣ SIZE-BASED CALIBRATION (CRITICAL)
         line_count = len([l for l in normalized_code.splitlines() if l.strip()])
+        size_penalty = False
 
         if line_count <= 4:
             plagiarism_score = min(plagiarism_score, 35.0)
+            size_penalty = True
         elif line_count <= 8:
             plagiarism_score = min(plagiarism_score, 60.0)
+            size_penalty = True
 
-        # 9️⃣ STORE AFTER COMPARISON
         self.faiss_index.add(vector)
-
-        code_hash = hashlib.sha256(code.encode()).hexdigest()
         self.repo.save_result(
-            code_hash=code_hash,
-            plagiarism_score=plagiarism_score,
-            ai_probability=ai_probability,
-            normalized_code=normalized_code,
-            ast_features=ast_features
+            hashlib.sha256(code.encode()).hexdigest(),
+            plagiarism_score,
+            ai_probability,
+            normalized_code,
+            ast_features
+        )
+
+        reasoning = (
+            "Small code sample; score capped to avoid overestimation."
+            if size_penalty else
+            "Similarity based on semantic, token, and structural overlap."
         )
 
         return {
             "plagiarism_percentage": round(plagiarism_score, 2),
             "ai_probability": round(ai_probability, 2),
-            "confidence": "medium"
+            "confidence": "medium",
+            "explanation": {
+                "token_similarity": round(token_sim, 3),
+                "semantic_similarity": round(semantic_sim, 3),
+                "structure_similarity": round(structure_sim, 3),
+                "code_lines": line_count,
+                "size_penalty_applied": size_penalty,
+                "reasoning": reasoning
+            }
         }
